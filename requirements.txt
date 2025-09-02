@@ -5,4 +5,4 @@ alembic
 python-jose[cryptography]
 passlib[bcrypt]
 pydantic[email]
-psycopg[binary]
+psycopg2-binary

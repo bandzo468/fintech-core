@@ -15,6 +15,25 @@ from passlib.context import CryptContext
 
 app = FastAPI(title="Mini Bank — Auth, States, Limits, Transactions")
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # tighten later to your frontend domain(s)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+import os
+from fastapi import Header, HTTPException, status
+
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "dev-admin-key")
+
+def require_admin(x_api_key: str | None = Header(default=None, alias="X-API-Key")):
+    if x_api_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
 import os
 
 SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./bank.db")
@@ -466,3 +485,21 @@ def apply_fees(db: Session = Depends(get_db)):
                 applied.append({"account_id": acc.id, "fee": fee})
 
     return {"applied": applied, "note": "Fee job run"}
+
+@app.get("/")
+def root():
+    return {"message": "Mini Bank API is live! 🚀 Visit /docs for API docs."}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/jobs/apply_interest", dependencies=[Depends(require_admin)])
+def jobs_apply_interest(db: Session = Depends(get_db)):
+    # ...existing logic...
+    return {"applied": applied, "note": "Daily interest job"}
+
+@app.post("/jobs/apply_fees", dependencies=[Depends(require_admin)])
+def jobs_apply_fees(db: Session = Depends(get_db)):
+    # ...existing logic...
+    return {"applied": applied, "note": "Monthly fee job"}

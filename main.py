@@ -1,46 +1,44 @@
-from fastapi.security import OAuth2PasswordRequestForm
-from jose import jwt
-from datetime import datetime, timedelta
-
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Optional, List
+import os
+import time
+import logging, sys
+from collections import defaultdict
 
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import FastAPI, HTTPException, Depends, Header, Request, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, OAuth2PasswordRequestForm
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
+
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 
 from sqlalchemy import (
     create_engine, Column, Integer, String, Float, DateTime, func, ForeignKey, or_
 )
 from sqlalchemy.orm import sessionmaker, Session, declarative_base
 
-from jose import JWTError, jwt
-from passlib.context import CryptContext
-
+# ===== App =====
 app = FastAPI(title="Mini Bank — Auth, States, Limits, Transactions")
 
-from fastapi.middleware.cors import CORSMiddleware
-
+# ===== CORS =====
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten later to your frontend domain(s)
+    allow_origins=["*"],        # tighten to your frontend domain(s) later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-import logging, sys
+
+# ===== Logging =====
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
     stream=sys.stdout,
 )
 logger = logging.getLogger("mini-bank")
-logger.info("transfer requested from=%s to=%s amount=%s", from_id, to_id, amount)
 
-import time
-from collections import defaultdict
-from fastapi import Request
-
+# ===== Rate limit (simple in-memory) =====
 RATE_LIMIT = 60        # requests
 WINDOW_SEC = 60        # per minute
 bucket = defaultdict(list)
@@ -49,41 +47,33 @@ async def rate_limit(request: Request):
     ip = request.client.host if request.client else "unknown"
     now = time.time()
     window_start = now - WINDOW_SEC
-    # prune old
     bucket[ip] = [t for t in bucket[ip] if t >= window_start]
     if len(bucket[ip]) >= RATE_LIMIT:
         raise HTTPException(status_code=429, detail="Too Many Requests")
     bucket[ip].append(now)
 
-import os
-from fastapi import Header, HTTPException, status
-
+# ===== Admin API key guard (for cron-like jobs) =====
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "dev-admin-key")
 
 def require_admin(x_api_key: str | None = Header(default=None, alias="X-API-Key")):
     if x_api_key != ADMIN_API_KEY:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
 
-import os
-
+# ===== Config =====
 SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./bank.db")
 SECRET_KEY = os.getenv("SECRET_KEY", "CHANGE_ME_IN_PROD")
-
-
-# ===== Config =====
-SQLALCHEMY_DATABASE_URL = "sqlite:///./bank.db"
-SECRET_KEY = "CHANGE_ME_TO_A_RANDOM_LONG_SECRET"  # <- replace in prod
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24h
 
 # ===== DB Setup =====
-engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+connect_args = {"check_same_thread": False} if SQLALCHEMY_DATABASE_URL.startswith("sqlite") else {}
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 # ===== Security Helpers =====
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-http_bearer = HTTPBearer()  # gives "Authorize" button in Swagger
+http_bearer = HTTPBearer()  # enables "Authorize" (Bearer) in Swagger
 
 def hash_password(p: str) -> str:
     return pwd_context.hash(p)
@@ -111,16 +101,16 @@ class Account(Base):
     name = Column(String, nullable=False, index=True)
     email = Column(String, nullable=True)
     balance = Column(Float, nullable=False, default=0.0)
-    state = Column(String, nullable=False, default="active")  # active|frozen|closed
+    state = Column(String, nullable=False, default="active")      # active|frozen|closed
     daily_limit = Column(Float, nullable=False, default=1000.0)
-    interest_rate = Column(Float, nullable=False, default=0.01)  # 1% annual
-    last_interest_date = Column(DateTime, nullable=True)  # instead of server_default=func.now()
+    interest_rate = Column(Float, nullable=False, default=0.01)   # 1% annual
+    last_interest_date = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
 
 class Transaction(Base):
     __tablename__ = "transactions"
     id = Column(Integer, primary_key=True)
-    type = Column(String, nullable=False)  # deposit|transfer
+    type = Column(String, nullable=False)  # deposit|transfer|interest|fee
     amount = Column(Float, nullable=False)
     from_account_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
     to_account_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
@@ -234,8 +224,17 @@ def tx_to_dict(tx: Transaction):
 def startup():
     Base.metadata.create_all(bind=engine)
 
-# ===== Public endpoints: register & login =====
-@app.post("/auth/register", response_model=TokenOut)
+# ===== Root / Health =====
+@app.get("/")
+def root():
+    return {"message": "Mini Bank API is live! 🚀 Visit /docs for API docs."}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+# ===== Auth =====
+@app.post("/auth/register", response_model=TokenOut, dependencies=[Depends(rate_limit)])
 def register(body: RegisterIn, db: Session = Depends(get_db)):
     if db.query(User).filter(User.email == body.email).first():
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -244,7 +243,7 @@ def register(body: RegisterIn, db: Session = Depends(get_db)):
     token = create_access_token(subject=user.email)
     return TokenOut(access_token=token)
 
-@app.post("/auth/login", response_model=TokenOut)
+@app.post("/auth/login", response_model=TokenOut, dependencies=[Depends(rate_limit)])
 def login(body: LoginIn, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == body.email).first()
     if not user or not verify_password(body.password, user.password_hash):
@@ -352,15 +351,12 @@ def transfer(body: Transfer, db: Session = Depends(get_db), current: User = Depe
     from_acc = must_acc(db, body.from_id)
     to_acc = must_acc(db, body.to_id)
 
-    # Only the OWNER of the from-account can send
     if from_acc.user_id != current.id:
         raise HTTPException(status_code=403, detail="You can only send from your own account")
 
-    # Receiver can be anyone, but both must be active
     ensure_active(from_acc)
     ensure_active(to_acc, for_receive=True)
 
-    # Daily limit check
     already = sent_today(db, from_acc.id)
     if already + body.amount > from_acc.daily_limit:
         remaining = max(0.0, from_acc.daily_limit - already)
@@ -369,7 +365,8 @@ def transfer(body: Transfer, db: Session = Depends(get_db), current: User = Depe
     if from_acc.balance < body.amount:
         raise HTTPException(status_code=400, detail="Insufficient funds")
 
-    # Post transfer
+logger.info("transfer requested from=%s to=%s amount=%s", from_id, to_id, amount)
+
     from_acc.balance -= float(body.amount)
     to_acc.balance += float(body.amount)
     db.add(from_acc); db.add(to_acc); db.commit()
@@ -393,7 +390,7 @@ def transfer(body: Transfer, db: Session = Depends(get_db), current: User = Depe
         "tx_id": tx.id,
     }
 
-# ===== Transactions & Admin actions =====
+# ===== Transactions & admin actions =====
 @app.get("/accounts/{account_id}/transactions")
 def account_transactions(account_id: int, limit: int = 50, db: Session = Depends(get_db), current: User = Depends(get_current_user)):
     acc = must_acc(db, account_id)
@@ -444,7 +441,6 @@ def set_limit(account_id: int, body: LimitUpdate, db: Session = Depends(get_db),
     db.add(acc); db.commit(); db.refresh(acc)
     return {"account_id": acc.id, "daily_limit": acc.daily_limit}
 
-# ===== Audit =====
 @app.get("/audit/trial_balance")
 def trial_balance(db: Session = Depends(get_db), current: User = Depends(get_current_user)):
     total_accounts = db.query(func.coalesce(func.sum(Account.balance), 0.0)).scalar()
@@ -457,22 +453,17 @@ def trial_balance(db: Session = Depends(get_db), current: User = Depends(get_cur
         "note": "Bank snapshot for audit visibility",
     }
 
-from datetime import date, datetime
-
-@app.post("/jobs/apply_interest")
-def apply_interest(db: Session = Depends(get_db)):
+# ===== Jobs (admin-key protected) =====
+@app.post("/jobs/apply_interest", dependencies=[Depends(require_admin)])
+def jobs_apply_interest(db: Session = Depends(get_db)):
     today = date.today()
     accounts = db.query(Account).filter(Account.state == "active").all()
     applied = []
-
     for acc in accounts:
-        # Apply if never applied OR last applied before today
         if acc.last_interest_date and acc.last_interest_date.date() >= today:
             continue
-
         daily_rate = acc.interest_rate / 365.0
         interest_amt = acc.balance * daily_rate
-
         if interest_amt > 0:
             acc.balance += interest_amt
             acc.last_interest_date = datetime.utcnow()
@@ -487,81 +478,26 @@ def apply_interest(db: Session = Depends(get_db)):
             db.commit()
             db.refresh(acc)
             applied.append({"account_id": acc.id, "interest": interest_amt})
-
     return {"applied": applied, "note": "Daily interest job"}
 
-
-@app.post("/jobs/apply_fees")
-def apply_fees(db: Session = Depends(get_db)):
+@app.post("/jobs/apply_fees", dependencies=[Depends(require_admin)])
+def jobs_apply_fees(db: Session = Depends(get_db)):
     accounts = db.query(Account).filter(Account.state == "active").all()
     applied = []
-
     for acc in accounts:
-        if acc.balance < 100:  # Example: balance under $100
+        if acc.balance < 100:
             fee = 5.0
             if acc.balance >= fee:
                 acc.balance -= fee
                 db.add(acc)
-                tx = Transaction(
+                db.add(Transaction(
                     type="fee",
                     amount=fee,
                     from_account_id=acc.id,
                     to_account_id=None,
                     memo="Low balance fee"
-                )
-                db.add(tx)
+                ))
                 db.commit()
                 db.refresh(acc)
                 applied.append({"account_id": acc.id, "fee": fee})
-
     return {"applied": applied, "note": "Fee job run"}
-
-@app.get("/")
-def root():
-    return {"message": "Mini Bank API is live! 🚀 Visit /docs for API docs."}
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-@app.post("/jobs/apply_interest", dependencies=[Depends(require_admin)])
-def jobs_apply_interest(db: Session = Depends(get_db)):
-    # ...existing logic...
-    return {"applied": applied, "note": "Daily interest job"}
-
-@app.post("/jobs/apply_fees", dependencies=[Depends(require_admin)])
-def jobs_apply_fees(db: Session = Depends(get_db)):
-    # ...existing logic...
-    return {"applied": applied, "note": "Monthly fee job"}
-
-@app.post("/auth/register", dependencies=[Depends(rate_limit)])
-def register(user: UserCreate, db: Session = Depends(get_db)):
-    hashed_pw = get_password_hash(user.password)
-    db_user = User(email=user.email, hashed_password=hashed_pw)
-    db.add(db_user)
-    db.commit()
-    db.refresh(db_user)
-    return db_user
-
-
-@app.get("/accounts", dependencies=[Depends(rate_limit)])
-def list_accounts(db: Session = Depends(get_db)):
-    accounts = db.query(Account).all()
-    return accounts
-
-
-@app.post("/auth/login", dependencies=[Depends(rate_limit)])
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == form_data.username).first()
-    if not user or not verify_password(form_data.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-
-    # build token
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    token_data = {"sub": str(user.id), "exp": expire}
-    access_token = jwt.encode(token_data, SECRET_KEY, algorithm=ALGORITHM)
-
-    return {"access_token": access_token, "token_type": "bearer"}
-
-
-

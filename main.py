@@ -1,11 +1,6 @@
-import logging, sys
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    stream=sys.stdout,
-)
-logger = logging.getLogger("mini-bank")
-logger.info("transfer requested from=%s to=%s amount=%s", from_id, to_id, amount)
+from fastapi.security import OAuth2PasswordRequestForm
+from jose import jwt
+from datetime import datetime, timedelta
 
 from datetime import datetime, timedelta
 from typing import Optional, List
@@ -33,6 +28,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+import logging, sys
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("mini-bank")
+logger.info("transfer requested from=%s to=%s amount=%s", from_id, to_id, amount)
+
 import time
 from collections import defaultdict
 from fastapi import Request
@@ -531,10 +535,33 @@ def jobs_apply_fees(db: Session = Depends(get_db)):
     return {"applied": applied, "note": "Monthly fee job"}
 
 @app.post("/auth/register", dependencies=[Depends(rate_limit)])
-def register(...): ...
+def register(user: UserCreate, db: Session = Depends(get_db)):
+    hashed_pw = get_password_hash(user.password)
+    db_user = User(email=user.email, hashed_password=hashed_pw)
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
 
-@app.post("/auth/login", dependencies=[Depends(rate_limit)])
-def login(...): ...
 
 @app.get("/accounts", dependencies=[Depends(rate_limit)])
-def list_accounts(...): ...
+def list_accounts(db: Session = Depends(get_db)):
+    accounts = db.query(Account).all()
+    return accounts
+
+
+@app.post("/auth/login", dependencies=[Depends(rate_limit)])
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    # build token
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    token_data = {"sub": str(user.id), "exp": expire}
+    access_token = jwt.encode(token_data, SECRET_KEY, algorithm=ALGORITHM)
+
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+

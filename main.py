@@ -1,3 +1,12 @@
+import logging, sys
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("mini-bank")
+logger.info("transfer requested from=%s to=%s amount=%s", from_id, to_id, amount)
+
 from datetime import datetime, timedelta
 from typing import Optional, List
 
@@ -24,6 +33,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+import time
+from collections import defaultdict
+from fastapi import Request
+
+RATE_LIMIT = 60        # requests
+WINDOW_SEC = 60        # per minute
+bucket = defaultdict(list)
+
+async def rate_limit(request: Request):
+    ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    window_start = now - WINDOW_SEC
+    # prune old
+    bucket[ip] = [t for t in bucket[ip] if t >= window_start]
+    if len(bucket[ip]) >= RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="Too Many Requests")
+    bucket[ip].append(now)
 
 import os
 from fastapi import Header, HTTPException, status
@@ -503,3 +529,12 @@ def jobs_apply_interest(db: Session = Depends(get_db)):
 def jobs_apply_fees(db: Session = Depends(get_db)):
     # ...existing logic...
     return {"applied": applied, "note": "Monthly fee job"}
+
+@app.post("/auth/register", dependencies=[Depends(rate_limit)])
+def register(...): ...
+
+@app.post("/auth/login", dependencies=[Depends(rate_limit)])
+def login(...): ...
+
+@app.get("/accounts", dependencies=[Depends(rate_limit)])
+def list_accounts(...): ...
